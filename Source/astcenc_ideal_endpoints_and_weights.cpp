@@ -841,6 +841,193 @@ float compute_error_of_weight_set_2planes(
 	return hadd_s(error_summav);
 }
 
+#if (ASTCENC_AVX >= 2)
+// ZenImp W203: AVX-512 register-permute gather for compute_ideal_weights_for_
+// decimation. The hot loops gather ei.weights / ei.weight_error_scale /
+// infilled_weights indexed by texel. Zen5's hardware vgatherdps is microcoded
+// and load-latency bound. For small blocks (texel_count <= 48 - i.e. up to 6x6,
+// the size this workload uses) the whole lookup table is register-resident in
+// 3 zmm, so the gather becomes an in-register permute (vpermt2ps + vpermps) with
+// NO memory access. Bit-identical to the gather (same elements). Larger blocks
+// (e.g. 8x8 = 64) exceed register residency and fall back to the AVX2 path.
+#if defined(__clang__) || defined(__GNUC__)
+#define ZENIMP_AVX512_TARGET __attribute__((target("avx512f,avx512vl,avx512dq,avx512bw")))
+#else
+#define ZENIMP_AVX512_TARGET
+#endif
+
+// Self-contained runtime AVX-512F detection. An AVX2 build of this library
+// can still run on a host without AVX-512F, so this is checked per-call
+// alongside the texel_count bound, independent of the ASTCENC_AVX build
+// configuration which only guarantees AVX2.
+#if !defined(__clang__) && defined(_MSC_VER)
+#include <intrin.h>
+
+static bool zenimp_cpu_supports_avx512f()
+{
+	static int cached = -1;
+	if (cached < 0)
+	{
+		int data[4];
+		__cpuid(data, 0);
+		if (data[0] >= 7)
+		{
+			__cpuidex(data, 7, 0);
+			// AVX512F = Bank 7, EBX, bit 16
+			cached = (data[1] & (1 << 16)) ? 1 : 0;
+		}
+		else
+		{
+			cached = 0;
+		}
+	}
+
+	return cached != 0;
+}
+#else
+#include <cpuid.h>
+
+static bool zenimp_cpu_supports_avx512f()
+{
+	static int cached = -1;
+	if (cached < 0)
+	{
+		unsigned int data[4];
+		cached = 0;
+		if (__get_cpuid_count(7, 0, &data[0], &data[1], &data[2], &data[3]))
+		{
+			// AVX512F = Bank 7, EBX, bit 16
+			cached = (data[1] & (1 << 16)) ? 1 : 0;
+		}
+	}
+
+	return cached != 0;
+}
+#endif
+
+// Max texels for which the lookup table fits in 3 zmm registers (3 * 16 = 48).
+static constexpr unsigned int ZENIMP_PERM_GATHER_MAX_TEXELS = 48;
+
+struct perm_table3 {
+	__m512 t0, t1, t2;
+};
+
+ZENIMP_AVX512_TARGET
+static ASTCENC_SIMD_INLINE perm_table3 perm_load3(const float* base)
+{
+	// Safe: weight arrays always have capacity for 64 elements.
+	return { _mm512_loadu_ps(base), _mm512_loadu_ps(base + 16), _mm512_loadu_ps(base + 32) };
+}
+
+ZENIMP_AVX512_TARGET
+static ASTCENC_SIMD_INLINE vfloat perm_gather3(const perm_table3& t, vint idx)
+{
+	__m512i vi = _mm512_castsi256_si512(idx.m);          // low 8 lanes = indices
+	__m512 lo = _mm512_permutex2var_ps(t.t0, vi, t.t1);  // table[idx] for idx < 32
+	__m512 hi = _mm512_permutexvar_ps(
+		_mm512_sub_epi32(vi, _mm512_set1_epi32(32)), t.t2); // table[idx] for idx in [32,48)
+	__mmask16 ge32 = _mm512_cmpge_epi32_mask(vi, _mm512_set1_epi32(32));
+	__m512 r = _mm512_mask_blend_ps(ge32, lo, hi);
+	return vfloat(_mm512_castps512_ps256(r));
+}
+
+ZENIMP_AVX512_TARGET
+static void compute_ideal_weights_initial_avg_avx512(
+	const endpoints_and_weights& ei,
+	const decimation_info& di,
+	float* dec_weight_ideal_value)
+{
+	unsigned int weight_count = di.weight_count;
+	bool constant_wes = ei.is_constant_weight_error_scale;
+	vfloat weight_error_scale(ei.weight_error_scale[0]);
+
+	perm_table3 wtab = perm_load3(ei.weights);
+	perm_table3 etab = constant_wes ? wtab : perm_load3(ei.weight_error_scale);
+
+	for (unsigned int i = 0; i < weight_count; i += ASTCENC_SIMD_WIDTH)
+	{
+		vfloat weight_weight(1e-10f);
+		vfloat initial_weight = vfloat::zero();
+
+		vint weight_texel_count(di.weight_texel_count + i);
+		unsigned int max_texel_count = hmax_s(weight_texel_count);
+		promise(max_texel_count > 0);
+
+		for (unsigned int j = 0; j < max_texel_count; j++)
+		{
+			const uint8_t* texel = di.weight_texels_tr[j] + i;
+			vint idx(texel);
+			vfloat weight = loada(di.weights_texel_contribs_tr[j] + i);
+
+			if (!constant_wes)
+			{
+				weight_error_scale = perm_gather3(etab, idx);
+			}
+
+			vfloat contrib_weight = weight * weight_error_scale;
+			weight_weight += contrib_weight;
+			initial_weight += perm_gather3(wtab, idx) * contrib_weight;
+		}
+
+		storea(initial_weight / weight_weight, dec_weight_ideal_value + i);
+	}
+}
+
+ZENIMP_AVX512_TARGET
+static void compute_ideal_weights_refine_avx512(
+	const endpoints_and_weights& ei,
+	const decimation_info& di,
+	float* dec_weight_ideal_value,
+	const float* infilled_weights,
+	float stepsize,
+	float chd_scale)
+{
+	unsigned int weight_count = di.weight_count;
+	bool constant_wes = ei.is_constant_weight_error_scale;
+	vfloat weight_error_scale(ei.weight_error_scale[0]);
+
+	perm_table3 wtab = perm_load3(ei.weights);
+	perm_table3 etab = constant_wes ? wtab : perm_load3(ei.weight_error_scale);
+	perm_table3 itab = perm_load3(infilled_weights);
+
+	for (unsigned int i = 0; i < weight_count; i += ASTCENC_SIMD_WIDTH)
+	{
+		vfloat weight_val = loada(dec_weight_ideal_value + i);
+
+		vfloat error_change0(1e-10f);
+		vfloat error_change1(0.0f);
+
+		vint weight_texel_count(di.weight_texel_count + i);
+		unsigned int max_texel_count = hmax_s(weight_texel_count);
+		promise(max_texel_count > 0);
+
+		for (unsigned int j = 0; j < max_texel_count; j++)
+		{
+			const uint8_t* texel = di.weight_texels_tr[j] + i;
+			vint idx(texel);
+			vfloat contrib_weight = loada(di.weights_texel_contribs_tr[j] + i);
+
+			if (!constant_wes)
+			{
+				weight_error_scale = perm_gather3(etab, idx);
+			}
+
+			vfloat scale = weight_error_scale * contrib_weight;
+			vfloat old_weight = perm_gather3(itab, idx);
+			vfloat ideal_weight = perm_gather3(wtab, idx);
+
+			error_change0 += contrib_weight * scale;
+			error_change1 += (old_weight - ideal_weight) * scale;
+		}
+
+		vfloat step = (error_change1 * vfloat(chd_scale)) / error_change0;
+		step = clamp(-stepsize, stepsize, step);
+
+		storea(weight_val + step, dec_weight_ideal_value + i);
+	}
+}
+#endif // ASTCENC_AVX >= 2
+
 /* See header for documentation. */
 void compute_ideal_weights_for_decimation(
 	const endpoints_and_weights& ei,
@@ -872,6 +1059,18 @@ void compute_ideal_weights_for_decimation(
 	bool constant_wes = ei.is_constant_weight_error_scale;
 	vfloat weight_error_scale(ei.weight_error_scale[0]);
 
+	// ZenImp W203: small blocks (texel_count <= 48, i.e. up to 6x6) use the
+	// AVX-512 register-permute gather; larger blocks fall back to the AVX2 path.
+#if (ASTCENC_AVX >= 2)
+	const bool zenimp_use_perm =
+		(texel_count <= ZENIMP_PERM_GATHER_MAX_TEXELS) && zenimp_cpu_supports_avx512f();
+	if (zenimp_use_perm)
+	{
+		compute_ideal_weights_initial_avg_avx512(ei, di, dec_weight_ideal_value);
+	}
+	else
+#endif
+	{
 	// This overshoots - this is OK as we initialize the array tails in the
 	// decimation table structures to safe values ...
 	for (unsigned int i = 0; i < weight_count; i += ASTCENC_SIMD_WIDTH)
@@ -903,6 +1102,7 @@ void compute_ideal_weights_for_decimation(
 
 		storea(initial_weight / weight_weight, dec_weight_ideal_value + i);
 	}
+	}
 
 	// Populate the interpolated weight grid based on the initial average
 	// Process SIMD-width texel coordinates at at time while we can. Safe to
@@ -929,6 +1129,15 @@ void compute_ideal_weights_for_decimation(
 	// Empirically determined step size; larger values don't help but smaller drops image quality
 	constexpr float stepsize = 0.25f;
 	constexpr float chd_scale = -WEIGHTS_TEXEL_SUM;
+
+#if (ASTCENC_AVX >= 2)
+	if (zenimp_use_perm)
+	{
+		compute_ideal_weights_refine_avx512(
+			ei, di, dec_weight_ideal_value, infilled_weights, stepsize, chd_scale);
+		return;
+	}
+#endif
 
 	for (unsigned int i = 0; i < weight_count; i += ASTCENC_SIMD_WIDTH)
 	{
