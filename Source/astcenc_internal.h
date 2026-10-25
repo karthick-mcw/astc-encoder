@@ -2139,6 +2139,13 @@ bool cpu_supports_sse41();
 bool cpu_supports_avx2();
 
 /**
+ * @brief Run-time detection if the host CPU supports AVX-512F.
+ *
+ * @return @c true if the host CPU supports AVX-512F, @c false otherwise.
+ */
+bool cpu_supports_avx512f();
+
+/**
  * @brief Allocate an aligned memory buffer.
  *
  * Allocated memory must be freed by aligned_free;

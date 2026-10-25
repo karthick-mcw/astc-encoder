@@ -42,6 +42,9 @@ static bool g_cpu_has_popcnt { false };
 /** Does this CPU support F16C? Set to -1 if not yet initialized. */
 static bool g_cpu_has_f16c { false };
 
+/** Does this CPU support AVX-512F? Set to false if not yet initialized. */
+static bool g_cpu_has_avx512f { false };
+
 /* ============================================================================
    Platform code for Visual Studio
 ============================================================================ */
@@ -76,6 +79,8 @@ static void detect_cpu_isa()
 		__cpuidex(data, 7, 0);
 		// AVX2 = Bank 7, EBX, bit 5
 		g_cpu_has_avx2 = data[1] & (1 << 5) ? true : false;
+		// AVX512F = Bank 7, EBX, bit 16
+		g_cpu_has_avx512f = data[1] & (1 << 16) ? true : false;
 	}
 
 	// Ensure state bits are updated before init flag is updated
@@ -107,10 +112,13 @@ static void detect_cpu_isa()
 	}
 
 	g_cpu_has_avx2 = 0;
+	g_cpu_has_avx512f = 0;
 	if (__get_cpuid_count(7, 0, &data[0], &data[1], &data[2], &data[3]))
 	{
 		// AVX2 = Bank 7, EBX, bit 5
 		g_cpu_has_avx2 = data[1] & (1 << 5) ? true : false;
+		// AVX512F = Bank 7, EBX, bit 16
+		g_cpu_has_avx512f = data[1] & (1 << 16) ? true : false;
 	}
 
 	// Ensure state bits are updated before init flag is updated
@@ -161,6 +169,17 @@ bool cpu_supports_avx2()
 	}
 
 	return g_cpu_has_avx2;
+}
+
+/* See header for documentation. */
+bool cpu_supports_avx512f()
+{
+	if (!g_init)
+	{
+		detect_cpu_isa();
+	}
+
+	return g_cpu_has_avx512f;
 }
 
 #endif
