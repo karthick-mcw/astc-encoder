@@ -1068,7 +1068,7 @@ void compute_ideal_weights_for_decimation(
 		for (unsigned int i = 0; i < texel_count; i += ASTCENC_SIMD_WIDTH)
 		{
 			vfloat weight = bilinear_infill_vla_2(di, dec_weight_ideal_value, i);
-			storea(weight, infilled_weights + i);
+			storea(weight - loada(ei.weights + i), infilled_weights + i);
 		}
 	}
 	else
@@ -1076,7 +1076,7 @@ void compute_ideal_weights_for_decimation(
 		for (unsigned int i = 0; i < texel_count; i += ASTCENC_SIMD_WIDTH)
 		{
 			vfloat weight = bilinear_infill_vla(di, dec_weight_ideal_value, i);
-			storea(weight, infilled_weights + i);
+			storea(weight - loada(ei.weights + i), infilled_weights + i);
 		}
 	}
 
@@ -1119,11 +1119,10 @@ void compute_ideal_weights_for_decimation(
 			}
 
 			vfloat scale = weight_error_scale * contrib_weight;
-			vfloat old_weight = gatherf(infilled_weights, texel);
-			vfloat ideal_weight = gatherf(ei.weights, texel);
+			vfloat weight_diff = gatherf(infilled_weights, texel);
 
 			error_change0 += contrib_weight * scale;
-			error_change1 += (old_weight - ideal_weight) * scale;
+			error_change1 += weight_diff * scale;
 		}
 
 		vfloat step = (error_change1 * chd_scale) / error_change0;
